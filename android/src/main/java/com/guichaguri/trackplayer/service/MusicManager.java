@@ -1,366 +1,425 @@
-package com.guichaguri.trackplayer.service;
+package com.guichaguri.trackplayer.service.player;
 
-import android.annotation.SuppressLint;
-import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
-import android.media.AudioAttributes;
-import android.media.AudioFocusRequest;
-import android.media.AudioManager;
-import android.media.AudioManager.OnAudioFocusChangeListener;
-import android.net.wifi.WifiManager;
-import android.net.wifi.WifiManager.WifiLock;
-import android.os.Build;
-import android.os.Bundle;
-import android.os.Handler;
-import android.os.PowerManager;
-import android.os.PowerManager.WakeLock;
-import androidx.annotation.RequiresApi;
+import android.support.v4.media.session.PlaybackStateCompat;
 import android.util.Log;
-import com.google.android.exoplayer2.C;
-import com.google.android.exoplayer2.DefaultLoadControl;
-import com.google.android.exoplayer2.DefaultRenderersFactory;
-import com.google.android.exoplayer2.ExoPlayerFactory;
-import com.google.android.exoplayer2.LoadControl;
-import com.google.android.exoplayer2.SimpleExoPlayer;
-import com.google.android.exoplayer2.trackselection.DefaultTrackSelector;
-import com.guichaguri.trackplayer.module.MusicEvents;
-import com.guichaguri.trackplayer.service.metadata.MetadataManager;
+import androidx.annotation.NonNull;
+import com.facebook.react.bridge.Promise;
+import com.google.android.exoplayer2.*;
+import com.google.android.exoplayer2.Player.EventListener;
+import com.google.android.exoplayer2.Timeline.Window;
+import com.google.android.exoplayer2.metadata.Metadata;
+import com.google.android.exoplayer2.metadata.MetadataOutput;
+import com.google.android.exoplayer2.metadata.icy.IcyHeaders;
+import com.google.android.exoplayer2.metadata.icy.IcyInfo;
+import com.google.android.exoplayer2.metadata.id3.TextInformationFrame;
+import com.google.android.exoplayer2.metadata.id3.UrlLinkFrame;
+import com.google.android.exoplayer2.source.TrackGroup;
+import com.google.android.exoplayer2.source.TrackGroupArray;
+import com.google.android.exoplayer2.trackselection.TrackSelectionArray;
+import com.guichaguri.trackplayer.service.MusicManager;
+import com.guichaguri.trackplayer.service.Utils;
 import com.guichaguri.trackplayer.service.models.Track;
-import com.guichaguri.trackplayer.service.player.ExoPlayback;
-import com.guichaguri.trackplayer.service.player.LocalPlayback;
-
-import static com.google.android.exoplayer2.DefaultLoadControl.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
 
 /**
  * @author Guichaguri
  */
-public class MusicManager implements OnAudioFocusChangeListener {
+public abstract class ExoPlayback<T extends Player> implements EventListener, MetadataOutput {
 
-    private final MusicService service;
+    protected final Context context;
+    protected final MusicManager manager;
+    protected final T player;
 
-    private final WakeLock wakeLock;
-    private final WifiLock wifiLock;
+    protected List<Track> queue = Collections.synchronizedList(new ArrayList<>());
 
-    private MetadataManager metadata;
-    private ExoPlayback playback;
+    // https://github.com/google/ExoPlayer/issues/2728
+    protected int lastKnownWindow = C.INDEX_UNSET;
+    protected long lastKnownPosition = C.POSITION_UNSET;
+    protected int previousState = PlaybackStateCompat.STATE_NONE;
+    protected float volumeMultiplier = 1.0F;
 
-    @RequiresApi(26)
-    private AudioFocusRequest focus = null;
-    private boolean hasAudioFocus = false;
-    private boolean wasDucking = false;
+    public ExoPlayback(Context context, MusicManager manager, T player) {
+        this.context = context;
+        this.manager = manager;
+        this.player = player;
 
-    private BroadcastReceiver noisyReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            service.emit(MusicEvents.BUTTON_PAUSE, null);
-        }
-    };
-    private boolean receivingNoisyEvents = false;
-
-    private boolean stopWithApp = false;
-    private boolean alwaysPauseOnInterruption = false;
-
-    @SuppressLint("InvalidWakeLockTag")
-    public MusicManager(MusicService service) {
-        this.service = service;
-        this.metadata = new MetadataManager(service, this);
-
-        PowerManager powerManager = (PowerManager)service.getSystemService(Context.POWER_SERVICE);
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "track-player-wake-lock");
-        wakeLock.setReferenceCounted(false);
-
-        // Android 7: Use the application context here to prevent any memory leaks
-        WifiManager wifiManager = (WifiManager)service.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL, "track-player-wifi-lock");
-        wifiLock.setReferenceCounted(false);
+        Player.MetadataComponent component = player.getMetadataComponent();
+        if(component != null) component.addMetadataOutput(this);
     }
 
-    public ExoPlayback getPlayback() {
-        return playback;
+    public void initialize() {
+        player.addListener(this);
     }
 
-    public boolean shouldStopWithApp() {
-        return stopWithApp;
+    public List<Track> getQueue() {
+        return queue;
     }
 
-    public void setStopWithApp(boolean stopWithApp) {
-        this.stopWithApp = stopWithApp;
+    public abstract void add(Track track, int index, Promise promise);
+
+    public abstract void add(Collection<Track> tracks, int index, Promise promise);
+
+    public abstract void remove(List<Integer> indexes, Promise promise);
+
+    public abstract void removeUpcomingTracks();
+
+    public void updateTrack(int index, Track track) {
+        int currentIndex = player.getCurrentWindowIndex();
+
+        queue.set(index, track);
+
+        if(currentIndex == index)
+            manager.getMetadata().updateMetadata(this, track);
     }
 
-    public void setAlwaysPauseOnInterruption(boolean alwaysPauseOnInterruption) {
-        this.alwaysPauseOnInterruption = alwaysPauseOnInterruption;
+    public Track getCurrentTrack() {
+        int index = player.getCurrentWindowIndex();
+        return index < 0 || index >= queue.size() ? null : queue.get(index);
     }
 
-    public MetadataManager getMetadata() {
-        return metadata;
-    }
-
-    public Handler getHandler() {
-        return service.handler;
-    }
-
-    public void switchPlayback(ExoPlayback playback) {
-        if(this.playback != null) {
-            this.playback.stop();
-            this.playback.destroy();
+    public void skip(String id, Promise promise) {
+        if(id == null || id.isEmpty()) {
+            promise.reject("invalid_id", "The ID can't be null or empty");
+            return;
         }
 
-        this.playback = playback;
+        for(int i = 0; i < queue.size(); i++) {
+            if(id.equals(queue.get(i).id)) {
+                lastKnownWindow = player.getCurrentWindowIndex();
+                lastKnownPosition = player.getCurrentPosition();
 
-        if(this.playback != null) {
-            this.playback.initialize();
-        }
-    }
-
-    public LocalPlayback createLocalPlayback(Bundle options) {
-        int minBuffer = (int)Utils.toMillis(options.getDouble("minBuffer", Utils.toSeconds(DEFAULT_MIN_BUFFER_MS)));
-        int maxBuffer = (int)Utils.toMillis(options.getDouble("maxBuffer", Utils.toSeconds(DEFAULT_MAX_BUFFER_MS)));
-        int playBuffer = (int)Utils.toMillis(options.getDouble("playBuffer", Utils.toSeconds(DEFAULT_BUFFER_FOR_PLAYBACK_MS)));
-        int backBuffer = (int)Utils.toMillis(options.getDouble("backBuffer", Utils.toSeconds(DEFAULT_BACK_BUFFER_DURATION_MS)));
-        long cacheMaxSize = (long)(options.getDouble("maxCacheSize", 0) * 1024);
-        int multiplier = DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS / DEFAULT_BUFFER_FOR_PLAYBACK_MS;
-
-        LoadControl control = new DefaultLoadControl.Builder()
-                .setBufferDurationsMs(minBuffer, maxBuffer, playBuffer, playBuffer * multiplier)
-                .setBackBuffer(backBuffer, false)
-                .createDefaultLoadControl();
-
-        SimpleExoPlayer player = new SimpleExoPlayer.Builder(service)
-                .setLoadControl(control)
-                .build();
-
-        player.setAudioAttributes(new com.google.android.exoplayer2.audio.AudioAttributes.Builder()
-                .setContentType(C.CONTENT_TYPE_MUSIC).setUsage(C.USAGE_MEDIA).build());
-
-        return new LocalPlayback(service, this, player, cacheMaxSize);
-    }
-
-    @SuppressLint("WakelockTimeout")
-    public void onPlay() {
-        Log.d(Utils.LOG, "onPlay");
-        if(playback == null) return;
-
-        Track track = playback.getCurrentTrack();
-        if(track == null) return;
-
-        if(!playback.isRemote()) {
-            requestFocus();
-
-            if(!receivingNoisyEvents) {
-                receivingNoisyEvents = true;
-                service.registerReceiver(noisyReceiver, new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY));
-            }
-
-            if(!wakeLock.isHeld()) wakeLock.acquire();
-
-            if(!Utils.isLocal(track.uri)) {
-                if(!wifiLock.isHeld()) wifiLock.acquire();
+                player.seekToDefaultPosition(i);
+                promise.resolve(null);
+                return;
             }
         }
 
-        metadata.setActive(true);
+        promise.reject("track_not_in_queue", "Given track ID was not found in queue");
     }
 
-    public void onPause() {
-        Log.d(Utils.LOG, "onPause");
+    public void skipToPrevious(Promise promise) {
+        int prev = player.getPreviousWindowIndex();
 
-        // Unregisters the noisy receiver
-        if(receivingNoisyEvents) {
-            service.unregisterReceiver(noisyReceiver);
-            receivingNoisyEvents = false;
+        if(prev == C.INDEX_UNSET) {
+            promise.reject("no_previous_track", "There is no previous track");
+            return;
         }
 
-        // Release the wake and the wifi locks
-        if(wakeLock.isHeld()) wakeLock.release();
-        if(wifiLock.isHeld()) wifiLock.release();
+        lastKnownWindow = player.getCurrentWindowIndex();
+        lastKnownPosition = player.getCurrentPosition();
 
-        metadata.setActive(true);
+        player.seekToDefaultPosition(prev);
+        promise.resolve(null);
     }
 
-    public void onStop() {
-        Log.d(Utils.LOG, "onStop");
+    public void skipToNext(Promise promise) {
+        int next = player.getNextWindowIndex();
 
-        // Unregisters the noisy receiver
-        if(receivingNoisyEvents) {
-            service.unregisterReceiver(noisyReceiver);
-            receivingNoisyEvents = false;
+        if(next == C.INDEX_UNSET) {
+            promise.reject("queue_exhausted", "There is no tracks left to play");
+            return;
         }
 
-        // Release the wake and the wifi locks
-        if(wakeLock.isHeld()) wakeLock.release();
-        if(wifiLock.isHeld()) wifiLock.release();
+        lastKnownWindow = player.getCurrentWindowIndex();
+        lastKnownPosition = player.getCurrentPosition();
 
-        abandonFocus();
-
-        metadata.setActive(false);
+        player.seekToDefaultPosition(next);
+        promise.resolve(null);
     }
 
-    public void onStateChange(int state) {
-        Log.d(Utils.LOG, "onStateChange");
-
-        Bundle bundle = new Bundle();
-        bundle.putInt("state", state);
-        service.emit(MusicEvents.PLAYBACK_STATE, bundle);
-        metadata.updatePlayback(playback);
+    public void play() {
+        player.setPlayWhenReady(true);
     }
 
-    public void onTrackUpdate(Track previous, long prevPos, Track next) {
-        Log.d(Utils.LOG, "onTrackUpdate");
-
-        if(next != null) metadata.updateMetadata(playback, next);
-
-        Bundle bundle = new Bundle();
-        bundle.putString("track", previous != null ? previous.id : null);
-        bundle.putDouble("position", Utils.toSeconds(prevPos));
-        bundle.putString("nextTrack", next != null ? next.id : null);
-        service.emit(MusicEvents.PLAYBACK_TRACK_CHANGED, bundle);
+    public void pause() {
+        player.setPlayWhenReady(false);
     }
 
-    public void onReset() {
-        metadata.removeNotifications();
+    public void stop() {
+        lastKnownWindow = player.getCurrentWindowIndex();
+        lastKnownPosition = player.getCurrentPosition();
+
+        player.stop(false);
+        player.setPlayWhenReady(false);
+        player.seekTo(lastKnownWindow,0);
     }
 
-    public void onEnd(Track previous, long prevPos) {
-        Log.d(Utils.LOG, "onEnd");
+    public void reset() {
+        lastKnownWindow = player.getCurrentWindowIndex();
+        lastKnownPosition = player.getCurrentPosition();
 
-        Bundle bundle = new Bundle();
-        bundle.putString("track", previous != null ? previous.id : null);
-        bundle.putDouble("position", Utils.toSeconds(prevPos));
-        service.emit(MusicEvents.PLAYBACK_QUEUE_ENDED, bundle);
+        player.stop(true);
+        player.setPlayWhenReady(false);
     }
 
-    public void onMetadataReceived(String source, String title, String url, String artist, String album, String date, String genre) {
-        Log.d(Utils.LOG, "onMetadataReceived: " + source);
-
-        Bundle bundle = new Bundle();
-        bundle.putString("source", source);
-        bundle.putString("title", title);
-        bundle.putString("url", url);
-        bundle.putString("artist", artist);
-        bundle.putString("album", album);
-        bundle.putString("date", date);
-        bundle.putString("genre", genre);
-        service.emit(MusicEvents.PLAYBACK_METADATA, bundle);
+    public boolean isRemote() {
+        return false;
     }
 
-    public void onError(String code, String error) {
-        Log.d(Utils.LOG, "onError");
-        Log.e(Utils.LOG, "Playback error: " + code + " - " + error);
-
-        Bundle bundle = new Bundle();
-        bundle.putString("code", code);
-        bundle.putString("message", error);
-        service.emit(MusicEvents.PLAYBACK_ERROR, bundle);
+    public long getPosition() {
+        return player.getCurrentPosition();
     }
 
-    @Override
-    public void onAudioFocusChange(int focus) {
-        Log.d(Utils.LOG, "onDuck");
+    public long getBufferedPosition() {
+        return player.getBufferedPosition();
+    }
 
-        boolean permanent = false;
-        boolean paused = false;
-        boolean ducking = false;
+    public long getDuration() {
+        Track current = getCurrentTrack();
 
-        switch(focus) {
-            case AudioManager.AUDIOFOCUS_LOSS:
-                permanent = true;
-                abandonFocus();
-            case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
-                paused = true;
-                break;
-            case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
-                if (alwaysPauseOnInterruption)
-                    paused = true;
-                else
-                    ducking = true;
-                break;
-            default:
-                break;
+        if (current != null && current.duration > 0) {
+            return current.duration;
         }
 
-        if (ducking) {
-            playback.setVolumeMultiplier(0.5F);
-            wasDucking = true;
-        } else if (wasDucking) {
-            playback.setVolumeMultiplier(1.0F);
-            wasDucking = false;
-        }
+        long duration = player.getDuration();
 
-        Bundle bundle = new Bundle();
-        bundle.putBoolean("permanent", permanent);
-        bundle.putBoolean("paused", paused);
-        service.emit(MusicEvents.BUTTON_DUCK, bundle);
+        return duration == C.TIME_UNSET ? 0 : duration;
     }
 
-    private void requestFocus() {
-        if(hasAudioFocus) return;
-        Log.d(Utils.LOG, "Requesting audio focus...");
+    public void seekTo(long time) {
+        lastKnownWindow = player.getCurrentWindowIndex();
+        lastKnownPosition = player.getCurrentPosition();
 
-        AudioManager manager = (AudioManager)service.getSystemService(Context.AUDIO_SERVICE);
-        int r;
-
-        if(manager == null) {
-            r = AudioManager.AUDIOFOCUS_REQUEST_FAILED;
-        } else if(Build.VERSION.SDK_INT >= 26) {
-            focus = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                    .setOnAudioFocusChangeListener(this)
-                    .setAudioAttributes(new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .build())
-                    .setWillPauseWhenDucked(alwaysPauseOnInterruption)
-                    .build();
-
-            r = manager.requestAudioFocus(focus);
-        } else {
-            //noinspection deprecation
-            r = manager.requestAudioFocus(this, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
-        }
-
-        hasAudioFocus = r == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+        player.seekTo(time);
     }
 
-    private void abandonFocus() {
-        if(!hasAudioFocus) return;
-        Log.d(Utils.LOG, "Abandoning audio focus...");
+    public float getVolume() {
+        return getPlayerVolume() / volumeMultiplier;
+    }
 
-        AudioManager manager = (AudioManager)service.getSystemService(Context.AUDIO_SERVICE);
-        int r;
+    public void setVolume(float volume) {
+        setPlayerVolume(volume * volumeMultiplier);
+    }
 
-        if(manager == null) {
-            r = AudioManager.AUDIOFOCUS_REQUEST_FAILED;
-        } else if(Build.VERSION.SDK_INT >= 26) {
-            r = manager.abandonAudioFocusRequest(focus);
-        } else {
-            //noinspection deprecation
-            r = manager.abandonAudioFocus(this);
+    public void setVolumeMultiplier(float multiplier) {
+        setPlayerVolume(getVolume() * multiplier);
+        this.volumeMultiplier = multiplier;
+    }
+
+    public abstract float getPlayerVolume();
+
+    public abstract void setPlayerVolume(float volume);
+
+    public float getRate() {
+        return player.getPlaybackParameters().speed;
+    }
+
+    public void setRate(float rate) {
+        player.setPlaybackParameters(new PlaybackParameters(rate, player.getPlaybackParameters().pitch));
+    }
+
+    public int getState() {
+        switch(player.getPlaybackState()) {
+            case Player.STATE_BUFFERING:
+                return player.getPlayWhenReady() ? PlaybackStateCompat.STATE_BUFFERING : PlaybackStateCompat.STATE_CONNECTING;
+            case Player.STATE_ENDED:
+                return PlaybackStateCompat.STATE_STOPPED;
+            case Player.STATE_IDLE:
+                return PlaybackStateCompat.STATE_NONE;
+            case Player.STATE_READY:
+                return player.getPlayWhenReady() ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED;
         }
-
-        hasAudioFocus = r != AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+        return PlaybackStateCompat.STATE_NONE;
     }
 
     public void destroy() {
-        Log.d(Utils.LOG, "Releasing service resources...");
+        player.release();
+    }
 
-        // Disable audio focus
-        abandonFocus();
+    @Override
+    public void onTimelineChanged(@NonNull Timeline timeline, int reason) {
+        Log.d(Utils.LOG, "onTimelineChanged: " + reason);
 
-        // Stop receiving audio becoming noisy events
-        if(receivingNoisyEvents) {
-            service.unregisterReceiver(noisyReceiver);
-            receivingNoisyEvents = false;
+        if((reason == Player.TIMELINE_CHANGE_REASON_PREPARED || reason == Player.TIMELINE_CHANGE_REASON_DYNAMIC) && !timeline.isEmpty()) {
+            onPositionDiscontinuity(Player.DISCONTINUITY_REASON_INTERNAL);
+        }
+    }
+
+    @Override
+    public void onPositionDiscontinuity(int reason) {
+        Log.d(Utils.LOG, "onPositionDiscontinuity: " + reason);
+
+        if(lastKnownWindow != player.getCurrentWindowIndex()) {
+            Track previous = lastKnownWindow == C.INDEX_UNSET || lastKnownWindow >= queue.size() ? null : queue.get(lastKnownWindow);
+            Track next = getCurrentTrack();
+
+            // Track changed because it ended
+            // We'll use its duration instead of the last known position
+            if (reason == Player.DISCONTINUITY_REASON_PERIOD_TRANSITION && lastKnownWindow != C.INDEX_UNSET) {
+                if (lastKnownWindow >= player.getCurrentTimeline().getWindowCount()) return;
+                long duration = player.getCurrentTimeline().getWindow(lastKnownWindow, new Window()).getDurationMs();
+                if(duration != C.TIME_UNSET) lastKnownPosition = duration;
+            }
+
+            manager.onTrackUpdate(previous, lastKnownPosition, next);
         }
 
-        // Release the playback resources
-        if(playback != null) playback.destroy();
+        lastKnownWindow = player.getCurrentWindowIndex();
+        lastKnownPosition = player.getCurrentPosition();
+    }
 
-        // Release the metadata resources
-        metadata.destroy();
+    @Override
+    public void onTracksChanged(TrackGroupArray trackGroups, @NonNull TrackSelectionArray trackSelections) {
+        for(int i = 0; i < trackGroups.length; i++) {
+            // Loop through all track groups.
+            // As for the current implementation, there should be only one
+            TrackGroup group = trackGroups.get(i);
 
-        // Release the locks
-        if(wifiLock.isHeld()) wifiLock.release();
-        if(wakeLock.isHeld()) wakeLock.release();
+            for(int f = 0; f < group.length; f++) {
+                // Loop through all formats inside the track group
+                Format format = group.getFormat(f);
+
+                // Parse the metadata if it is present
+                if (format.metadata != null) {
+                    onMetadata(format.metadata);
+                }
+            }
+        }
+    }
+
+    @Override
+    public void onLoadingChanged(boolean isLoading) {
+        // Buffering updates
+    }
+
+    @Override
+    public void onPlayerStateChanged(boolean playWhenReady, int playbackState) {
+        int state = getState();
+
+        if(state != previousState) {
+            if(Utils.isPlaying(state) && !Utils.isPlaying(previousState)) {
+                manager.onPlay();
+            } else if(Utils.isPaused(state) && !Utils.isPaused(previousState)) {
+                manager.onPause();
+            } else if(Utils.isStopped(state) && !Utils.isStopped(previousState)) {
+                manager.onStop();
+            }
+
+            manager.onStateChange(state);
+            previousState = state;
+
+            if(state == PlaybackStateCompat.STATE_STOPPED) {
+                Track previous = getCurrentTrack();
+                long position = getPosition();
+                manager.onTrackUpdate(previous, position, null);
+                manager.onEnd(previous, position);
+            }
+        }
+    }
+
+    @Override
+    public void onRepeatModeChanged(int repeatMode) {
+        // Repeat mode update
+    }
+
+    @Override
+    public void onShuffleModeEnabledChanged(boolean shuffleModeEnabled) {
+        // Shuffle mode update
+    }
+
+    @Override
+    public void onPlayerError(ExoPlaybackException error) {
+        String code;
+
+        if(error.type == ExoPlaybackException.TYPE_SOURCE) {
+            code = "playback-source";
+        } else if(error.type == ExoPlaybackException.TYPE_RENDERER) {
+            code = "playback-renderer";
+        } else {
+            code = "playback"; // Other unexpected errors related to the playback
+        }
+
+        manager.onError(code, error.getCause().getMessage());
+    }
+
+    @Override
+    public void onPlaybackParametersChanged(@NonNull PlaybackParameters playbackParameters) {
+        // Speed or pitch changes
+    }
+
+    @Override
+    public void onSeekProcessed() {
+        // Finished seeking
+    }
+
+    private void handleId3Metadata(Metadata metadata) {
+        String title = null, url = null, artist = null, album = null, date = null, genre = null;
+
+        for(int i = 0; i < metadata.length(); i++) {
+            Metadata.Entry entry = metadata.get(i);
+
+            if (entry instanceof TextInformationFrame) {
+                // ID3 text tag
+                TextInformationFrame id3 = (TextInformationFrame) entry;
+                String id = id3.id.toUpperCase();
+
+                if (id.equals("TIT2") || id.equals("TT2")) {
+                    title = id3.value;
+                } else if (id.equals("TALB") || id.equals("TOAL") || id.equals("TAL")) {
+                    album = id3.value;
+                } else if (id.equals("TOPE") || id.equals("TPE1") || id.equals("TP1")) {
+                    artist = id3.value;
+                } else if (id.equals("TDRC") || id.equals("TOR")) {
+                    date = id3.value;
+                } else if (id.equals("TCON") || id.equals("TCO")) {
+                    genre = id3.value;
+                }
+
+            } else if (entry instanceof UrlLinkFrame) {
+                // ID3 URL tag
+                UrlLinkFrame id3 = (UrlLinkFrame) entry;
+                String id = id3.id.toUpperCase();
+
+                if (id.equals("WOAS") || id.equals("WOAF") || id.equals("WOAR") || id.equals("WAR")) {
+                    url = id3.url;
+                }
+
+            }
+        }
+
+        if (title != null || url != null || artist != null || album != null || date != null || genre != null) {
+            manager.onMetadataReceived("id3", title, url, artist, album, date, genre);
+        }
+    }
+
+    private void handleIcyMetadata(Metadata metadata) {
+        for (int i = 0; i < metadata.length(); i++) {
+            Metadata.Entry entry = metadata.get(i);
+
+            if(entry instanceof IcyHeaders) {
+                // ICY headers
+                IcyHeaders icy = (IcyHeaders)entry;
+
+                manager.onMetadataReceived("icy-headers", icy.name, icy.url, null, null, null, icy.genre);
+
+            } else if(entry instanceof IcyInfo) {
+                // ICY data
+                IcyInfo icy = (IcyInfo)entry;
+
+                String artist, title;
+                int index = icy.title == null ? -1 : icy.title.indexOf(" - ");
+
+                if (index != -1) {
+                    artist = icy.title.substring(0, index);
+                    title = icy.title.substring(index + 3);
+                } else {
+                    artist = null;
+                    title = icy.title;
+                }
+
+                manager.onMetadataReceived("icy", title, icy.url, artist, null, null, null);
+
+            }
+        }
+    }
+
+    @Override
+    public void onMetadata(@NonNull Metadata metadata) {
+        handleId3Metadata(metadata);
+        handleIcyMetadata(metadata);
     }
 }
